@@ -1,0 +1,206 @@
+
+services:
+  vuefront:
+    image: crpi-ncj9jrb3jfedicto.cn-hangzhou.personal.cr.aliyuncs.com/autoplatform/itp-frontend:latest
+    container_name: itp-vuefront
+    ports:
+      - "${FRONTEND_PORT}:${FRONTEND_PORT}"
+    volumes:
+      - ${NGINX_LOGS_DIR}:/var/log/nginx
+      - ${STATIC_DATA}:/data/static
+      - ${MEDIA_DATA}:/data/media
+
+    depends_on:
+      - django-app
+    restart: unless-stopped
+    networks:
+      - itp-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:18899/"]
+      interval: 60s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+
+  django-app:
+    image: crpi-ncj9jrb3jfedicto.cn-hangzhou.personal.cr.aliyuncs.com/autoplatform/itp-django:latest
+    container_name: itp-django-end
+    ports:
+      - "${DJANGO_PORT}:8000"
+    environment:
+      - DJANGO_SETTINGS_MODULE=ITP.settings.dev
+      - ALLOWED_HOSTS=*
+      - CELERY_BROKER_URL=redis://redis:6379/6
+      - CELERY_RESULT_BACKEND=redis://redis:6379/7
+      - FIRST_DEPLOY=${FIRST_DEPLOY}
+      # 确保这些数据库相关环境变量也被传递
+      - MYSQL_HOST=${MYSQL_HOST}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      # 添加管理员账户信息
+      - DJANGO_SUPERUSER_USERNAME=${ADMIN_USERNAME}
+      - DJANGO_SUPERUSER_EMAIL=${ADMIN_EMAIL}
+      - DJANGO_SUPERUSER_PASSWORD=${ADMIN_PASSWORD}
+    volumes:
+      - ${STATIC_DATA}:/data/static
+      - ${MEDIA_DATA}:/data/media
+      - ${DJANGO_LOGS_DIR}:/var/log/django
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - itp-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    command: >    
+      sh -c "
+      . /envs/dj/bin/activate &&
+      cd /data/ITP &&
+      echo 'Starting Django application...' &&
+      python manage.py collectstatic --noinput &&
+      echo 'Running migrations...' &&
+      python manage.py migrate &&
+      echo 'Starting Gunicorn server...' &&
+      exec /envs/dj/bin/gunicorn ITP.wsgi:application --name ITP --workers 3 --bind 0.0.0.0:8000 --log-level info --log-file -
+      "
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8000/swagger/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 900s
+
+
+  mysql:
+
+    image: mysql:5.7
+    container_name: itp-mysql
+    ports:
+      - "${MYSQL_PORT}:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: itp_user
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    restart: unless-stopped
+    command: [
+      '--character-set-server=utf8mb4',
+      '--collation-server=utf8mb4_unicode_ci',
+      '--init-connect=SET NAMES utf8mb4'
+    ]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 5s
+      retries: 10
+    networks:
+      - itp-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  redis:
+    image: redis:alpine
+    container_name: itp-redis
+    ports:
+      - "${REDIS_PORT}:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - itp-network
+
+  celery-worker:
+    image: crpi-ncj9jrb3jfedicto.cn-hangzhou.personal.cr.aliyuncs.com/autoplatform/itp-celery-worker:latest
+    container_name: itp-celery-worker
+    command: /envs/dj/bin/celery -A ITP.celery_app worker --loglevel=info -P threads
+    environment:
+      - DJANGO_SETTINGS_MODULE=ITP.settings.dev
+      - CELERY_BROKER_URL=redis://redis:6379/6
+      - TZ=Asia/Shanghai
+    depends_on:
+      - redis
+      - mysql
+    restart: unless-stopped
+    networks:
+      - itp-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+    volumes:
+      - ${MEDIA_DATA}:/data/media
+      - ./ITP:/app
+      - ${STATIC_DATA}:/data/static
+
+  # 更新 celery-beat 服务配置
+  celery-beat:
+    image: crpi-ncj9jrb3jfedicto.cn-hangzhou.personal.cr.aliyuncs.com/autoplatform/itp-celery-beat:latest
+    container_name: itp-celery-beat
+    command: >
+      sh -c "
+      . /envs/dj/bin/activate &&
+      cd /data/ITP &&
+      echo 'Waiting for services to be ready...' &&
+      sleep 20 &&
+      echo 'Starting Celery Beat...' &&
+      exec /envs/dj/bin/celery -A ITP.celery_app beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+      "
+    environment:
+      - DJANGO_SETTINGS_MODULE=ITP.settings.dev
+      - CELERY_BROKER_URL=redis://redis:6379/6
+      - TZ=Asia/Shanghai
+      - MYSQL_HOST=${MYSQL_HOST}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      # 添加其他必要的环境变量
+      - DJANGO_SUPERUSER_USERNAME=${ADMIN_USERNAME}
+      - DJANGO_SUPERUSER_EMAIL=${ADMIN_EMAIL}
+      - DJANGO_SUPERUSER_PASSWORD=${ADMIN_PASSWORD}
+    depends_on:
+      redis:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      django-app:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - itp-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+    volumes:
+      - ./ITP:/app
+      - ${STATIC_DATA}:/data/static
+      - ${MEDIA_DATA}:/data/media
+
+
+volumes:
+  mysql_data:
+  redis_data:
+  static-data:
+  media-data:
+
+networks:
+  itp-network:
+    driver: bridge
